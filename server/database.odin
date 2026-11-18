@@ -31,6 +31,21 @@ PlayerProfile :: struct {
 	wins:        i64    `json:"wins"`,
 }
 
+DatabaseMatchParticipant :: struct {
+	playerId: i64,
+	faction:  string,
+}
+
+DatabaseMatchPlayerResult :: struct {
+	playerId:   i64,
+	faction:    string,
+	publicVp:   int,
+	factionVp:  int,
+	directiveVp: int,
+	totalVp:    int,
+	winner:     bool,
+}
+
 DatabaseInit :: proc(database: ^Database, path: cstring) -> bool {
 	if result := sqlite.open(path, &database.connection); result != .Ok {
 		if database.connection != nil do sqlite.close(database.connection)
@@ -190,6 +205,107 @@ DatabaseRevokeSession :: proc(database: ^Database, token: string) -> bool {
 	if !DatabasePrepare(database, &stmt, "DELETE FROM sessions WHERE session_token = ?;") do return false
 	defer sqlite.finalize(stmt)
 	return DatabaseBindText(stmt, 1, token) && DatabaseStepDone(database, stmt)
+}
+
+DatabaseStartMatch :: proc(database: ^Database, seed: u64, participants: []DatabaseMatchParticipant) -> (matchId: i64, ok: bool) {
+	sync.lock(&database.mutex)
+	defer sync.unlock(&database.mutex)
+
+	if !DatabaseExecute(database, "BEGIN IMMEDIATE;") do return
+	committed := false
+	defer if !committed do DatabaseExecute(database, "ROLLBACK;")
+
+	stmt: ^sqlite.Statement
+	defer if stmt != nil do sqlite.finalize(stmt)
+
+	now := time.to_unix_seconds(time.now())
+	if !DatabasePrepare(database, &stmt, "INSERT INTO matches (started_at, seed) VALUES (?, ?);") do return
+	if !DatabaseBindInt64(stmt, 1, now) || !DatabaseBindInt64(stmt, 2, transmute(i64)seed) || !DatabaseStepDone(database, stmt) do return
+	sqlite.finalize(stmt)
+	stmt = nil
+
+	if !DatabasePrepare(database, &stmt, "SELECT last_insert_rowid();") do return
+	if sqlite.step(stmt) != .Row {
+		DatabaseLogError(database, "Could not get the new match ID")
+		return
+	}
+	newMatchId := sqlite.column_int64(stmt, 0)
+	sqlite.finalize(stmt)
+	stmt = nil
+
+	for participant in participants {
+		if !DatabasePrepare(database, &stmt, "INSERT INTO match_players (match_id, player_id, faction) VALUES (?, ?, ?);") do return
+		if !DatabaseBindInt64(stmt, 1, newMatchId) || !DatabaseBindInt64(stmt, 2, participant.playerId) ||
+			!DatabaseBindText(stmt, 3, participant.faction) || !DatabaseStepDone(database, stmt) {
+			return
+		}
+		sqlite.finalize(stmt)
+		stmt = nil
+	}
+
+	if !DatabaseExecute(database, "COMMIT;") do return
+	committed = true
+	matchId = newMatchId
+	ok = true
+	return
+}
+
+DatabaseFinishMatch :: proc(database: ^Database, matchId: i64, winnerPlayerId: i64, participants: []DatabaseMatchPlayerResult) -> bool {
+	sync.lock(&database.mutex)
+	defer sync.unlock(&database.mutex)
+
+	if !DatabaseExecute(database, "BEGIN IMMEDIATE;") do return false
+	committed := false
+	defer if !committed do DatabaseExecute(database, "ROLLBACK;")
+
+	now := time.to_unix_seconds(time.now())
+	stmt: ^sqlite.Statement
+	if !DatabasePrepare(database, &stmt, "UPDATE matches SET ended_at = ?, winner_player = ? WHERE match_id = ?;") do return false
+	if !DatabaseBindInt64(stmt, 1, now) || !DatabaseBindInt64(stmt, 2, winnerPlayerId) ||
+		!DatabaseBindInt64(stmt, 3, matchId) || !DatabaseStepDone(database, stmt) {
+		sqlite.finalize(stmt)
+		return false
+	}
+	if sqlite.changes(database.connection) != 1 {
+		sqlite.finalize(stmt)
+		return false
+	}
+	sqlite.finalize(stmt)
+
+	for participant in participants {
+		stmt = nil
+		if !DatabasePrepare(database, &stmt, "UPDATE match_players SET public_vp = ?, faction_vp = ?, directive_vp = ?, total_vp = ? WHERE match_id = ? AND player_id = ?;") do return false
+		if !DatabaseBindInt64(stmt, 1, i64(participant.publicVp)) || !DatabaseBindInt64(stmt, 2, i64(participant.factionVp)) ||
+			!DatabaseBindInt64(stmt, 3, i64(participant.directiveVp)) || !DatabaseBindInt64(stmt, 4, i64(participant.totalVp)) ||
+			!DatabaseBindInt64(stmt, 5, matchId) || !DatabaseBindInt64(stmt, 6, participant.playerId) ||
+			!DatabaseStepDone(database, stmt) {
+			sqlite.finalize(stmt)
+			return false
+		}
+		if sqlite.changes(database.connection) != 1 {
+			sqlite.finalize(stmt)
+			return false
+		}
+		sqlite.finalize(stmt)
+
+		stmt = nil
+		if !DatabasePrepare(database, &stmt, "UPDATE player_stats SET games_played = games_played + 1, wins = wins + ? WHERE player_id = ?;") do return false
+		winnerIncrement: i64 = 0
+		if participant.winner do winnerIncrement = 1
+		if !DatabaseBindInt64(stmt, 1, winnerIncrement) || !DatabaseBindInt64(stmt, 2, participant.playerId) || !DatabaseStepDone(database, stmt) {
+			sqlite.finalize(stmt)
+			return false
+		}
+		if sqlite.changes(database.connection) != 1 {
+			sqlite.finalize(stmt)
+			return false
+		}
+		sqlite.finalize(stmt)
+	}
+
+	if !DatabaseExecute(database, "COMMIT;") do return false
+	committed = true
+	return true
 }
 
 DatabaseRandomToken :: proc() -> string {

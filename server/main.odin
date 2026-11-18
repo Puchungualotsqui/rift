@@ -4,6 +4,9 @@ import http "../odin-http"
 import "core:fmt"
 import "core:log"
 import "core:net"
+import "core:os"
+import "core:sync"
+import "core:thread"
 import "core:strings"
 
 PORT :: 6969
@@ -11,6 +14,7 @@ DATABASE_PATH :: "rift.sqlite"
 
 App :: struct {
 	database: ^Database,
+	network:  NetworkState,
 }
 
 APIError :: struct {
@@ -40,9 +44,9 @@ main :: proc() {
 	if !DatabaseInit(&database, DATABASE_PATH) {
 		panic("Could not initialize the RIFT database")
 	}
-	defer DatabaseDeinit(&database)
-
 	app := App{database = &database}
+	NetworkInit(&app.network)
+	thread.run_with_poly_data(&app, WsServerThread)
 	handler := http.Handler{
 		user_data = &app,
 		handle = HandleRequest,
@@ -55,6 +59,11 @@ main :: proc() {
 	if err := http.listen_and_serve(&server, handler, endpoint); err != nil {
 		fmt.eprintln("HTTP server stopped with error: ", err)
 	}
+	sync.lock(&app.network.mutex)
+	app.network.shuttingDown = true
+	DatabaseDeinit(&database)
+	sync.unlock(&app.network.mutex)
+	os.exit(0)
 }
 
 HandleRequest :: proc(handler: ^http.Handler, request: ^http.Request, response: ^http.Response) {
