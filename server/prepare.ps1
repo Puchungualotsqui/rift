@@ -10,7 +10,7 @@ function Prepare-OdinServer {
         throw "odin.exe was not found on PATH. Install Odin and make it available in the Build Tools environment."
     }
 
-    if (-not (Test-Path (Join-Path $repoRoot "wsServerOdin\server.odin"))) {
-        throw "The pure-Odin wsServerOdin package was not found in the repository."
+    if (-not (Test-Path (Join-Path $repoRoot "wsServer\server.odin"))) {
+        throw "The pure-Odin wsServer package was not found in the repository."
     }
 }

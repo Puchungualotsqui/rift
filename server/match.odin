@@ -2,7 +2,7 @@ package server
 
 import "base:runtime"
 import logic "../logicEngine"
-import ws "../wsServerOdin"
+import ws "../wsServer"
 import "core:crypto"
 import "core:log"
 import "core:sync"

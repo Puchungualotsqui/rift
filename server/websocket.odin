@@ -1,7 +1,7 @@
 package server
 
 import logic "../logicEngine"
-import ws "../wsServerOdin"
+import ws "../wsServer"
 import "core:encoding/json"
 
 import "core:log"

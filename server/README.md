@@ -26,7 +26,7 @@ testing.
 
 The process listens on HTTP at `127.0.0.1:6969` and WebSocket at
 `127.0.0.1:6970`, and creates `rift.sqlite` in the working directory. The
-WebSocket listener uses the pure-Odin `wsServerOdin` package on a separate port.
+WebSocket listener uses the pure-Odin `wsServer` package on a separate port.
 Put both listeners behind a TLS-terminating reverse proxy before exposing them
 to clients; neither listener provides TLS.
 

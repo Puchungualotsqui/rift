@@ -2,7 +2,7 @@
 
 package server
 
-import ws "../wsServerOdin"
+import ws "../wsServer"
 import "core:encoding/json"
 import "core:net"
 import "core:sync"

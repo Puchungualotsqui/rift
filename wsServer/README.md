@@ -1,4 +1,4 @@
-# wsServerOdin
+# wsServer
 
 A pure-Odin WebSocket server package ported from
 [Theldus/wsServer](https://github.com/Theldus/wsServer). RIFT's server uses this
@@ -78,12 +78,11 @@ if the application needs a nonblocking start.
 
 ## Known limitations
 
-RIFT currently configures a cap of 32 clients. The package supports setting
-`maxConnections` to zero to disable that admission cap, but each connected client
-still uses an OS thread, so this is not a high-scale event loop and an unlimited
-setting is not a safe way to target thousands of clients. Ping scheduling is
-caller-driven. Autobahn/fuzz coverage and broader concurrency/load testing are
-still needed before claiming production readiness.
+RIFT configures `maxConnections = 0`, disabling the package's admission cap.
+Each connected client still uses an OS thread, so this is not a high-scale event
+loop and an unlimited setting is not a safe way to target thousands of clients.
+Ping scheduling is caller-driven. Autobahn/fuzz coverage and broader
+concurrency/load testing are still needed before claiming production readiness.
 
 ## Check and test
 

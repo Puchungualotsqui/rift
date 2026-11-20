@@ -1,12 +1,12 @@
 # RIFT — Network Architecture
 
-**Stack:** Odin + karl2d (client) · http-odin (server) · odin-steamworks (Steam) · saenai255/odin-wsserver (WebSocket) · WASM (web client) · SQLite (persistence)
+**Stack:** Odin + karl2d (client) · http-odin (server) · odin-steamworks (Steam) · wsServer (WebSocket) · WASM (web client) · SQLite (persistence)
 
 ---
 
 ## 1. High-Level Topology
 
-`http-odin` and `odin-wsserver` are separate server implementations that each bind their own socket. They run in the same process (or process group) but on two distinct internal ports, fronted by a reverse proxy that terminates TLS and routes traffic.
+`http-odin` and `wsServer` are separate server implementations that each bind their own socket. They run in the same process (or process group) but on two distinct internal ports, fronted by a reverse proxy that terminates TLS and routes traffic.
 
 ```mermaid
 flowchart LR
@@ -21,7 +21,7 @@ flowchart LR
 
     subgraph Process["Server Process"]
         H["http-odin<br/>(:8080 REST + static)"]
-        W["odin-wsserver<br/>(:8081 WebSocket)"]
+        W["wsServer<br/>(:8081 WebSocket)"]
         AUTH[Auth Service]
         LOBBY[Lobby / Matchmaking]
         GAME[Authoritative Game Server]
@@ -44,7 +44,7 @@ flowchart LR
 ```
 
 **Principles**
-- Two listeners behind one reverse proxy. `http-odin` and `odin-wsserver` never share a port.
+- Two listeners behind one reverse proxy. `http-odin` and `wsServer` never share a port.
 - Server is **authoritative** for all game state; clients send intents only.
 - Identity is **platform-agnostic**: every session resolves to one `player_id`.
 - Steam session tickets and web auth are **authentication methods**, not game identities.
@@ -162,7 +162,7 @@ sequenceDiagram
     participant SC as Steam Client
     participant H as http-odin
     participant V as Valve API
-    participant W as odin-wsserver
+    participant W as wsServer
 
     SC->>SC: GetAuthTicketForWebAPI("rift")
     SC->>H: POST /auth/steam (ticket)
@@ -184,7 +184,7 @@ sequenceDiagram
 sequenceDiagram
     participant WC as Web Client
     participant H as http-odin
-    participant W as odin-wsserver
+    participant W as wsServer
 
     WC->>H: POST /auth/guest
     H->>H: create players + auth_identities + guest_tokens + sessions
@@ -235,10 +235,10 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 
 ### 5.2 WebSocket (game + lobby)
 
-- URL: `wss://host/ws` (proxy forwards to `odin-wsserver` on `:8081`)
+- URL: `wss://host/ws` (proxy forwards to `wsServer` on `:8081`)
 - **Auth is mandatory as the first message.** The client MUST send `{ "op": "auth", "token": "<session_token>" }` immediately after the connection opens.
 - The server rejects any other `op` received before successful authentication, and closes the connection if no valid `auth` message arrives within **5 seconds**.
-- Do **not** rely on the `Authorization` header for WebSocket auth: `odin-wsserver` does not expose handshake headers to callbacks, and browser clients cannot set custom headers on WebSocket upgrade.
+- Do **not** rely on the `Authorization` header for WebSocket auth: `wsServer` does not expose handshake headers to callbacks, and browser clients cannot set custom headers on WebSocket upgrade.
 - Transport: JSON messages (upgrade to binary only if profiling demands it).
 
 #### Common envelope
@@ -303,7 +303,7 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 - **Never** simulate authoritative game state; render the last `match.state` and animate transitions.
 - Input lockout: disable actions when `turn_player != player_id` (server rejects anyway).
 - Predict nothing that can desync; prediction allowed only for cosmetics (animations).
-- Treat `odin-wsserver` as a stateful socket: handle disconnect and reconnect explicitly.
+- Treat `wsServer` as a stateful socket: handle disconnect and reconnect explicitly.
 
 ---
 
@@ -315,9 +315,9 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 | `auth` | http-odin | Steam, guest, OAuth verification; session issuing; account linking |
 | `db` | shared | SQLite access; serialised writes via single writer |
 | `valve` | http-odin | Steam Web API client (server-to-server HTTPS) |
-| `ws` | odin-wsserver | Connection lifecycle, per-connection state, `auth` gating |
-| `lobby` | odin-wsserver | Queue, private matches, ready checks |
-| `game` | odin-wsserver | RIFT rules engine, one instance per match |
+| `ws` | wsServer | Connection lifecycle, per-connection state, `auth` gating |
+| `lobby` | wsServer | Queue, private matches, ready checks |
+| `game` | wsServer | RIFT rules engine, one instance per match |
 
 ### Per-match game instance
 - Holds in-memory authoritative state (RIFT rules engine).
@@ -328,7 +328,7 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 
 ### Concurrency Model (locked)
 
-`odin-wsserver` runs **each client connection on its own OS thread**. `http-odin` runs its own request handlers. This has two hard consequences:
+`wsServer` runs **each client connection on its own OS thread**. `http-odin` runs its own request handlers. This has two hard consequences:
 
 1. **SQLite writes MUST be serialised.**
    - Route every write (`INSERT`, `UPDATE`, `DELETE`, DDL) through a **single writer thread** fed by an MPSC channel, or guard every write with a global mutex.
@@ -347,9 +347,9 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
    - Faction definitions, card definitions, objective cards, directive definitions are immutable after boot and may be read without locks.
 
 ### Process model
-- Start: one process runs `http-odin` on `:8080` and `odin-wsserver` on `:8081`, both behind a reverse proxy.
+- Start: one process runs `http-odin` on `:8080` and `wsServer` on `:8081`, both behind a reverse proxy.
 - SQLite writes go through the single writer thread regardless of which listener produced the write.
-- Shard later: split `http-odin` (auth + lobby REST) and `odin-wsserver` (game) into separate hosts, sharing SQLite over a network filesystem or migrating to Postgres if scale demands.
+- Shard later: split `http-odin` (auth + lobby REST) and `wsServer` (game) into separate hosts, sharing SQLite over a network filesystem or migrating to Postgres if scale demands.
 - SQLite is sufficient for the target scope; keep all writes on the single writer process.
 
 ---
@@ -366,7 +366,7 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 - Steam ticket verification must be server-to-server HTTPS to Valve.
 - Reject duplicate links: `UNIQUE(provider, provider_uid)` prevents two players claiming the same Steam account.
 - Log auth failures; do not log ticket contents or session tokens.
-- Never route `/ws` through `http-odin`; keep it on `odin-wsserver` behind the proxy so middleware assumptions stay correct.
+- Never route `/ws` through `http-odin`; keep it on `wsServer` behind the proxy so middleware assumptions stay correct.
 
 ---
 
@@ -376,7 +376,7 @@ All JSON. Auth via `Authorization: Bearer <session_token>` header.
 sequenceDiagram
     participant C as Client
     participant H as http-odin
-    participant W as odin-wsserver
+    participant W as wsServer
     participant D as SQLite writer
 
     C->>H: POST /auth/steam or /auth/guest
@@ -406,7 +406,7 @@ sequenceDiagram
 | Concern | Recommendation |
 |---|---|
 | Reverse proxy | Caddy terminates TLS; routes `/ws` to `:8081`, everything else to `:8080` |
-| Ports | `http-odin` on `:8080` (internal), `odin-wsserver` on `:8081` (internal); never expose either directly |
+| Ports | `http-odin` on `:8080` (internal), `wsServer` on `:8081` (internal); never expose either directly |
 | Static web assets | Served by `http-odin` from `/public` (WASM, JS glue, assets) |
 | TLS | Terminated at proxy; both listeners speak plain HTTP/WS internally |
 | SQLite backups | `sqlite3 .backup` on cron; offsite copy; single-writer thread keeps file consistent |
@@ -415,7 +415,7 @@ sequenceDiagram
 | Feature flags | Env vars; e.g. `ALLOW_GUEST=true`, `STEAM_REQUIRED=false` |
 | Match replay | Persist `seed` plus ordered `game.action` list per match (optional table) |
 | Versioning | Client sends `client_version`; server rejects below minimum |
-| Threads | Size `odin-wsserver` thread pool for expected concurrent connections; monitor per-thread CPU |
+| Threads | `wsServer` currently uses one OS thread per connection; account for thread and memory limits until an event-driven backend is implemented |
 
 ---
 
@@ -432,4 +432,4 @@ sequenceDiagram
 
 ---
 
-*RIFT Network Architecture v1.1 — aligns with RIFT Game Design Bible v1.0. Updated for saenai255/odin-wsserver (thread-per-connection), dual-listener topology behind reverse proxy, mandatory first-message WebSocket auth, and explicit SQLite writer serialisation.*
+*RIFT Network Architecture v1.1 — aligns with RIFT Game Design Bible v1.0. Updated for wsServer (thread-per-connection), dual-listener topology behind reverse proxy, mandatory first-message WebSocket auth, and explicit SQLite writer serialisation.*

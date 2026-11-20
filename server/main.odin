@@ -1,7 +1,7 @@
 package server
 
 import http "../odin-http"
-import ws "../wsServerOdin"
+import ws "../wsServer"
 import "core:fmt"
 import "core:log"
 import "core:net"
