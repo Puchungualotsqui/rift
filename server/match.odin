@@ -1,11 +1,12 @@
 package server
 
+import "base:runtime"
 import logic "../logicEngine"
-import ws "../odin-wsserver"
+import ws "../wsServerOdin"
 import "core:crypto"
-
 import "core:log"
 import "core:sync"
+import "core:time"
 
 MAX_LOBBY_PLAYERS :: 256
 
@@ -15,17 +16,29 @@ MatchStatus :: enum {
 	Finished,
 }
 
+WsClient :: struct {
+	server: ^ws.Server,
+	id:     ws.ClientID,
+}
+
+NO_WS_CLIENT :: WsClient{}
+
 NetworkState :: struct {
-	mutex:       sync.Mutex,
+	mutex:        sync.Mutex,
+	websocket:    ws.Server,
+	allocator:    runtime.Allocator,
 	shuttingDown: bool,
-	connections: map[ws.Client_Connection]WsConnection,
-	matches:     [dynamic]Match,
-	lobby:       [dynamic]LobbyEntry,
-	nextMatchId: i64,
+	authTimeout:  time.Duration,
+	connections:  map[WsClient]WsConnection,
+	matches:      [dynamic]Match,
+	lobby:        [dynamic]LobbyEntry,
+	nextMatchId:  i64,
 }
 
 WsConnection :: struct {
+	openedAt:      time.Tick,
 	authenticated: bool,
+	authTimedOut:  bool,
 	playerId:      i64,
 	sessionToken:  string,
 	displayName:   string,
@@ -36,7 +49,7 @@ WsConnection :: struct {
 LobbyEntry :: struct {
 	playerId:    i64,
 	displayName: string,
-	connection:  ws.Client_Connection,
+	connection:  WsClient,
 }
 
 MatchPlayer :: struct {
@@ -44,7 +57,7 @@ MatchPlayer :: struct {
 	displayName: string,
 	faction:     logic.Faction,
 	start:       logic.Hex,
-	connection:  ws.Client_Connection,
+	connection:  WsClient,
 	connected:   bool,
 	ready:       bool,
 }
@@ -259,26 +272,33 @@ ChatWire :: struct {
 
 
 NetworkInit :: proc(state: ^NetworkState) {
-	state.connections = make(map[ws.Client_Connection]WsConnection, 16, context.allocator)
-	state.matches = make([dynamic]Match, 0, 16, context.allocator)
-	state.lobby = make([dynamic]LobbyEntry, 0, MAX_LOBBY_PLAYERS, context.allocator)
+	state.allocator = context.allocator
+	state.connections = make(map[WsClient]WsConnection, 16, state.allocator)
+	state.matches = make([dynamic]Match, 0, 16, state.allocator)
+	state.lobby = make([dynamic]LobbyEntry, 0, MAX_LOBBY_PLAYERS, state.allocator)
+	state.authTimeout = WS_AUTH_TIMEOUT
 	state.nextMatchId = 1
-	when ODIN_OS == .Windows {
-		WsServerCompatLink(
-			transmute(rawptr)pthread_mutex_lock,
-			transmute(rawptr)pthread_mutex_unlock,
-			transmute(rawptr)pthread_mutex_init,
-			transmute(rawptr)pthread_mutex_destroy,
-			transmute(rawptr)pthread_cond_init,
-			transmute(rawptr)pthread_cond_destroy,
-			transmute(rawptr)pthread_cond_timedwait64,
-			transmute(rawptr)pthread_cond_signal,
-			transmute(rawptr)pthread_create,
-			transmute(rawptr)pthread_detach,
-			transmute(rawptr)pthread_join,
-			transmute(rawptr)clock_gettime64,
-		)
+}
+
+NetworkDeinit :: proc(state: ^NetworkState) {
+	for _, connection in state.connections {
+		if len(connection.sessionToken) > 0 do delete(connection.sessionToken, state.allocator)
+		if len(connection.displayName) > 0 do delete(connection.displayName, state.allocator)
 	}
+	for matchIndex in 0..<len(state.matches) {
+		match := &state.matches[matchIndex]
+		for playerIndex in 0..<match.playerCount {
+			player := &match.players[playerIndex]
+			if len(player.displayName) > 0 do delete(player.displayName, state.allocator)
+		}
+	}
+	for entry in state.lobby {
+		if len(entry.displayName) > 0 do delete(entry.displayName, state.allocator)
+	}
+	delete(state.connections)
+	delete(state.matches)
+	delete(state.lobby)
+	state^ = {}
 }
 
 FactionName :: proc(faction: logic.Faction) -> string {
@@ -402,15 +422,16 @@ BuildCombatChoice :: proc(data: WsClientData) -> (logic.CombatChoice, bool) {
 ApplyClientGameAction :: proc(game: ^logic.Game, data: WsClientData) -> (ok: bool, combat: logic.CombatResult, hasCombat: bool, observation: logic.ProtocolObservation, hasObservation: bool, reason: string) {
 	choice: logic.ProtocolChoice
 	combatChoice := logic.CombatChoice{attackerCard = logic.NO_CARD, defenderCard = logic.NO_CARD}
+	choiceOk, combatChoiceOk: bool
 	switch data.action {
 	case "protocol", "protocol_begin", "protocol_finish":
-		choice, choiceOk := BuildProtocolChoice(data)
+		choice, choiceOk = BuildProtocolChoice(data)
 		if !choiceOk {
 			reason = "invalid_choice"
 			return
 		}
 	case "strike", "hit_and_run":
-		combatChoice, combatChoiceOk := BuildCombatChoice(data)
+		combatChoice, combatChoiceOk = BuildCombatChoice(data)
 		if !combatChoiceOk {
 			reason = "invalid_combat_choice"
 			return

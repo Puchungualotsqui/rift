@@ -1,6 +1,7 @@
 package server
 
 import http "../odin-http"
+import ws "../wsServerOdin"
 import "core:fmt"
 import "core:log"
 import "core:net"
@@ -46,7 +47,39 @@ main :: proc() {
 	}
 	app := App{database = &database}
 	NetworkInit(&app.network)
-	thread.run_with_poly_data(&app, WsServerThread)
+	wsInitError := ws.ServerInit(
+		&app.network.websocket,
+		{address = net.IP4_Loopback, port = WS_PORT},
+		ws.Events{onOpen = WsOnOpen, onClose = WsOnClose, onMessage = WsOnMessage},
+		maxConnections = MAX_WS_CONNECTIONS,
+		maxMessageSize = MAX_WS_MESSAGE_BYTES,
+		userContext = rawptr(&app),
+	)
+	if wsInitError != .None {
+		NetworkDeinit(&app.network)
+		DatabaseDeinit(&database)
+		panic("Could not initialize the WebSocket server")
+	}
+	wsWorker := thread.create_and_start_with_poly_data(&app, WsServerThread)
+	if wsWorker == nil {
+		ws.ServerDeinit(&app.network.websocket)
+		NetworkDeinit(&app.network)
+		DatabaseDeinit(&database)
+		panic("Could not start the WebSocket server thread")
+	}
+	authTimeoutWorker := thread.create_and_start_with_poly_data(&app, WsAuthTimeoutThread)
+	if authTimeoutWorker == nil {
+		sync.lock(&app.network.mutex)
+		app.network.shuttingDown = true
+		sync.unlock(&app.network.mutex)
+		ws.ServerStop(&app.network.websocket)
+		thread.join(wsWorker)
+		thread.destroy(wsWorker)
+		ws.ServerDeinit(&app.network.websocket)
+		NetworkDeinit(&app.network)
+		DatabaseDeinit(&database)
+		panic("Could not start the WebSocket auth timeout thread")
+	}
 	handler := http.Handler{
 		user_data = &app,
 		handle = HandleRequest,
@@ -61,8 +94,15 @@ main :: proc() {
 	}
 	sync.lock(&app.network.mutex)
 	app.network.shuttingDown = true
-	DatabaseDeinit(&database)
 	sync.unlock(&app.network.mutex)
+	ws.ServerStop(&app.network.websocket)
+	thread.join(wsWorker)
+	thread.destroy(wsWorker)
+	thread.join(authTimeoutWorker)
+	thread.destroy(authTimeoutWorker)
+	ws.ServerDeinit(&app.network.websocket)
+	NetworkDeinit(&app.network)
+	DatabaseDeinit(&database)
 	os.exit(0)
 }
 

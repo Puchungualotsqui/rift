@@ -16,21 +16,19 @@ Run these from this directory:
 .\run.ps1
 ```
 
-The scripts initialize the Build Tools environment and, when needed, initialize
-the pinned `wsServer` submodule and run `wsserverSetup.ps1` to build the native
-WebSocket dependencies. First-time setup requires Git, CMake, MinGW-w64, WSL
-(with CMake and GCC), and the supplied C++ Build Tools. The WebSocket
-connection cap defaults to 32 clients per server (eight four-player matches).
-To rebuild with a different cap, run `..\wsserverSetup.ps1 -MaxClients 64`
-from this directory; valid values are 4–512. Capacity is per server process,
-not a guaranteed match count: clients also include authenticated users in the
-lobby and any other connected sessions.
+The scripts load `C:\BuildTools\devcmd.ps1` and check/build the server. Its
+WebSocket transport is pure Odin and requires no C, MinGW, CMake, or WSL setup.
+RIFT configures `MAX_WS_CONNECTIONS` to `0`, so there is no application-level
+WebSocket connection cap. The operating system, available memory, and current
+one-thread-per-client transport still impose practical limits; this is not a
+safe high-thousands connection target without an event-driven I/O model and load
+testing.
 
 The process listens on HTTP at `127.0.0.1:6969` and WebSocket at
 `127.0.0.1:6970`, and creates `rift.sqlite` in the working directory. The
-WebSocket listener is a separate port because `odin-wsserver` does not provide
-HTTP upgrade integration. Put both listeners behind a TLS-terminating reverse
-proxy before exposing them to clients; neither listener provides TLS.
+WebSocket listener uses the pure-Odin `wsServerOdin` package on a separate port.
+Put both listeners behind a TLS-terminating reverse proxy before exposing them
+to clients; neither listener provides TLS.
 
 ## Endpoints
 
@@ -42,7 +40,10 @@ proxy before exposing them to clients; neither listener provides TLS.
 Authenticated HTTP endpoints require `Authorization: Bearer <session_token>`.
 Session tokens are 256-bit values from the operating system cryptographic
 random source. Database writes use prepared statements and transactions. The
-SQLite connection and shared network state are mutex-protected.
+SQLite connection and shared network state are mutex-protected. WebSocket
+handling currently holds the shared network lock during database work and
+socket writes, so a slow peer can delay unrelated clients; keep the connection
+cap modest until I/O is decoupled and the server is load-tested.
 
 ## WebSocket
 
@@ -55,8 +56,9 @@ reverse proxy. The first JSON message must authenticate the connection:
 
 Every client message uses `{ "op", "seq", "data" }`; `seq` must increase
 for each connection. The server validates the session on every message. Client
-messages are JSON text frames only, limited to 2 KiB. Messages from an
-unauthenticated or expired session are rejected.
+messages are JSON text frames only, limited to 16 KiB. Connections that do not
+authenticate within 10 seconds are closed; messages from an unauthenticated or
+expired session are rejected.
 
 Supported client operations:
 

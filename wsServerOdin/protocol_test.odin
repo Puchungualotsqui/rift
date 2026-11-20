@@ -36,6 +36,22 @@ TestBuildHandshakeResponse :: proc(t: ^testing.T) {
 	badRequest := "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 12\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
 	_, _, err = BuildHandshakeResponse(transmute([]byte)badRequest)
 	testing.expect_value(t, err, HandshakeError.InvalidVersion)
+
+	upgradeList := "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: h2c, WebSocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nContent-Length: 0\r\n\r\n"
+	_, _, err = BuildHandshakeResponse(transmute([]byte)upgradeList)
+	testing.expect_value(t, err, HandshakeError.None)
+
+	lowercaseMethod := "get / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+	_, _, err = BuildHandshakeResponse(transmute([]byte)lowercaseMethod)
+	testing.expect_value(t, err, HandshakeError.InvalidRequestLine)
+
+	requestBody := "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nContent-Length: 1\r\n\r\nX"
+	_, _, err = BuildHandshakeResponse(transmute([]byte)requestBody)
+	testing.expect_value(t, err, HandshakeError.InvalidBodyFraming)
+
+	transferEncoded := "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nTransfer-Encoding: chunked\r\n\r\n"
+	_, _, err = BuildHandshakeResponse(transmute([]byte)transferEncoded)
+	testing.expect_value(t, err, HandshakeError.InvalidBodyFraming)
 }
 
 @(test)
@@ -51,6 +67,10 @@ TestDecodeClientFrame :: proc(t: ^testing.T) {
 	frameBytes[1] = 0x05
 	_, _, err = DecodeFrame(frameBytes[:], payload[:])
 	testing.expect_value(t, err, FrameError.UnmaskedClientFrame)
+
+	invalidCloseReason := [?]byte{0x88, 0x83, 0, 0, 0, 0, 0x03, 0xe8, 0xff}
+	_, _, err = DecodeFrame(invalidCloseReason[:], payload[:])
+	testing.expect_value(t, err, FrameError.InvalidUTF8)
 }
 
 @(test)

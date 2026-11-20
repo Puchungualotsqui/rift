@@ -57,7 +57,7 @@ TestMatchPersistenceLifecycle :: proc(t: ^testing.T) {
 		if DatabaseBindInt64(stmt, 1, matchId) && sqlite.step(stmt) == .Row {
 			testing.expect(t, sqlite.column_int64(stmt, 0) > 0)
 			testing.expect_value(t, sqlite.column_int64(stmt, 1), i64(0))
-			testing.expect_value(t, transmute(u64)sqlite.column_int64(stmt, 2), seed)
+			testing.expect_value(t, cast(u64)sqlite.column_int64(stmt, 2), seed)
 			testing.expect_value(t, sqlite.column_int64(stmt, 3), i64(0))
 		} else {
 			testing.expect(t, false)

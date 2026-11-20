@@ -1,35 +1,60 @@
 package server
 
 import logic "../logicEngine"
-import ws "../odin-wsserver"
+import ws "../wsServerOdin"
 import "core:encoding/json"
+
 import "core:log"
 import "core:strings"
 import "core:sync"
 import "core:time"
 
 WS_PORT :: 6970
-MAX_WS_MESSAGE_BYTES :: 2048
+MAX_WS_CONNECTIONS :: 0
+MAX_WS_MESSAGE_BYTES :: 16 * 1024
 MAX_CHAT_BYTES :: 500
+WS_AUTH_TIMEOUT :: 10 * time.Second
+WS_AUTH_TIMEOUT_CHECK_INTERVAL :: 250 * time.Millisecond
 
 LobbyUpdateWire :: struct {
 	players: []LobbyPlayerWire `json:"players"`,
 }
 
 WsServerThread :: proc(app: ^App) {
-	server := ws.Server{
-		host = "127.0.0.1",
-		port = WS_PORT,
-		timeout_ms = 5000,
-		evs = ws.Events{onopen = WsOnOpen, onclose = WsOnClose, onmessage = WsOnMessage},
-		ctx = app,
-	}
 	log.infof("WebSocket listener starting on 127.0.0.1:%d", WS_PORT)
-	result := ws.listen(&server)
-	log.errorf("WebSocket listener stopped with status %d", result)
+	result := ws.ServerRun(&app.network.websocket)
+	if result != .None do log.errorf("WebSocket listener stopped with status %v", result)
 }
 
-WsSend :: proc(client: ws.Client_Connection, op: string, seq: i64, data: $T) {
+WsAuthTimeoutThread :: proc(app: ^App) {
+	clients := make([dynamic]WsClient, 0, ws.DEFAULT_MAX_CONNECTIONS, app.network.allocator)
+	defer delete(clients)
+	for {
+		time.sleep(WS_AUTH_TIMEOUT_CHECK_INTERVAL)
+		clear(&clients)
+		now := time.tick_now()
+		sync.lock(&app.network.mutex)
+		if app.network.shuttingDown {
+			sync.unlock(&app.network.mutex)
+			return
+		}
+		for client, connection in app.network.connections {
+			elapsed := time.tick_diff(connection.openedAt, now)
+			if !connection.authenticated && !connection.authTimedOut && elapsed >= app.network.authTimeout do append(&clients, client)
+		}
+		for client in clients {
+			connection, exists := app.network.connections[client]
+			if exists && !connection.authenticated {
+				connection.authTimedOut = true
+				app.network.connections[client] = connection
+			}
+		}
+		sync.unlock(&app.network.mutex)
+		for client in clients do WsCloseClient(client)
+	}
+}
+
+WsSend :: proc(client: WsClient, op: string, seq: i64, data: $T) {
 	envelope := ServerEnvelope(T){
 		op = op,
 		seq = seq,
@@ -41,27 +66,34 @@ WsSend :: proc(client: ws.Client_Connection, op: string, seq: i64, data: $T) {
 		log.errorf("Could not encode WebSocket %s message: %s", op, err)
 		return
 	}
-	if ws.send_frame(client, payload, .Text) != 0 do log.warnf("Could not send WebSocket %s message", op)
+	if !ws.ServerSendFrame(client.server, client.id, .Text, payload) do log.warnf("Could not send WebSocket %s message", op)
 }
 
-WsSendError :: proc(client: ws.Client_Connection, seq: i64, code, message: string) {
+WsSendError :: proc(client: WsClient, seq: i64, code, message: string) {
 	WsSend(client, "error", seq, GenericErrorWire{code, message})
 }
 
-WsSendActionError :: proc(client: ws.Client_Connection, seq: i64, reason: string) {
+WsSendActionError :: proc(client: WsClient, seq: i64, reason: string) {
 	WsSend(client, "game.action_err", seq, ActionErrorWire{seq, reason})
 }
 
-WsOnOpen :: proc(client: ws.Client_Connection) {
-	app := ws.get_global_context(client, App)
+WsCloseClient :: proc(client: WsClient) {
+	if !ws.ServerCloseClient(client.server, client.id) do log.warnf("Could not begin WebSocket close for client %d", u64(client.id))
+}
+
+WsOnOpen :: proc(server: ^ws.Server, clientID: ws.ClientID) {
+	app := cast(^App)ws.ServerGetContext(server)
+	client := WsClient{server = server, id = clientID}
 	sync.lock(&app.network.mutex)
-	app.network.connections[client] = WsConnection{lastSequence = -1}
+	app.network.connections[client] = WsConnection{openedAt = time.tick_now(), lastSequence = -1}
 	sync.unlock(&app.network.mutex)
 }
 
-WsOnClose :: proc(client: ws.Client_Connection) {
-	app := ws.get_global_context(client, App)
+WsOnClose :: proc(server: ^ws.Server, clientID: ws.ClientID) {
+	app := cast(^App)ws.ServerGetContext(server)
+	client := WsClient{server = server, id = clientID}
 	sync.lock(&app.network.mutex)
+
 	connection, exists := app.network.connections[client]
 	if !exists {
 		sync.unlock(&app.network.mutex)
@@ -76,27 +108,28 @@ WsOnClose :: proc(client: ws.Client_Connection) {
 			seat := NetworkMatchPlayerIndex(match, connection.playerId)
 			if seat >= 0 && match.players[seat].connection == client {
 				match.players[seat].connected = false
-				match.players[seat].connection = 0
+				match.players[seat].connection = NO_WS_CLIENT
 			}
 		}
-		if len(connection.sessionToken) > 0 do delete(connection.sessionToken, context.allocator)
-		if len(connection.displayName) > 0 do delete(connection.displayName, context.allocator)
+		if len(connection.sessionToken) > 0 do delete(connection.sessionToken, app.network.allocator)
+		if len(connection.displayName) > 0 do delete(connection.displayName, app.network.allocator)
 		NetworkBroadcastLobbyUpdate(&app.network)
 	}
 	delete_key(&app.network.connections, client)
 	sync.unlock(&app.network.mutex)
 }
 
-WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.Frame_Type) {
-	app := ws.get_global_context(client, App)
-	if frameType != .Text {
+WsOnMessage :: proc(server: ^ws.Server, clientID: ws.ClientID, opcode: ws.Opcode, message: []byte) {
+	app := cast(^App)ws.ServerGetContext(server)
+	client := WsClient{server = server, id = clientID}
+	if opcode != .Text {
 		WsSendError(client, 0, "invalid_frame", "Only text JSON frames are supported")
-		ws.close_client(client)
+		WsCloseClient(client)
 		return
 	}
 	if len(message) == 0 || len(message) > MAX_WS_MESSAGE_BYTES {
 		WsSendError(client, 0, "invalid_message_size", "WebSocket message size is invalid")
-		ws.close_client(client)
+		WsCloseClient(client)
 		return
 	}
 
@@ -121,9 +154,10 @@ WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.F
 	connection, exists := app.network.connections[client]
 	if !exists {
 		WsSendError(client, request.seq, "unknown_connection", "Connection state is unavailable")
-		ws.close_client(client)
+		WsCloseClient(client)
 		return
 	}
+	if connection.authTimedOut do return
 	if request.seq <= connection.lastSequence {
 		WsSendError(client, request.seq, "stale_sequence", "seq must increase for every client message")
 		return
@@ -138,19 +172,19 @@ WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.F
 		}
 		if len(request.data.token) != 64 {
 			WsSendError(client, request.seq, "unauthorized", "A valid session token is required")
-			ws.close_client(client)
+			WsCloseClient(client)
 			return
 		}
 		profile, authenticated := DatabaseAuthenticate(app.database, request.data.token)
 		if !authenticated {
 			WsSendError(client, request.seq, "unauthorized", "The session is invalid or expired")
-			ws.close_client(client)
+			WsCloseClient(client)
 			return
 		}
 		connection.authenticated = true
 		connection.playerId = profile.playerId
-		connection.sessionToken = strings.clone(request.data.token, context.allocator)
-		connection.displayName = strings.clone(profile.displayName, context.allocator)
+		connection.sessionToken = strings.clone(request.data.token, app.network.allocator)
+		connection.displayName = strings.clone(profile.displayName, app.network.allocator)
 		app.network.connections[client] = connection
 		WsSend(client, "auth.ok", request.seq, AuthOkWire{profile.playerId, profile.displayName})
 		NetworkAttachPlayer(&app.network, client, &connection)
@@ -163,7 +197,7 @@ WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.F
 	}
 	if _, authenticated := DatabaseAuthenticate(app.database, connection.sessionToken); !authenticated {
 		WsSendError(client, request.seq, "unauthorized", "The session is invalid or expired")
-		ws.close_client(client)
+		WsCloseClient(client)
 		return
 	}
 	app.network.connections[client] = connection
@@ -186,6 +220,7 @@ WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.F
 		NetworkGameAction(app, client, &connection, request.data, request.seq)
 	case "game.end_turn":
 		NetworkEndTurn(app, client, &connection, request.seq)
+
 	case "game.forfeit":
 		NetworkForfeit(app, client, &connection, request.seq)
 	case "chat":
@@ -195,7 +230,7 @@ WsOnMessage :: proc(client: ws.Client_Connection, message: []u8, frameType: ws.F
 	}
 }
 
-NetworkAttachPlayer :: proc(network: ^NetworkState, client: ws.Client_Connection, connection: ^WsConnection) {
+NetworkAttachPlayer :: proc(network: ^NetworkState, client: WsClient, connection: ^WsConnection) {
 	for i in 0..<len(network.lobby) {
 		if network.lobby[i].playerId == connection.playerId {
 			network.lobby[i].connection = client
@@ -212,16 +247,16 @@ NetworkAttachPlayer :: proc(network: ^NetworkState, client: ws.Client_Connection
 			network.connections[client] = connection^
 			if match.status == .Started {
 				WsSend(client, "match.start", 0, BuildMatchStartWire(match))
-				NetworkSendMatchState(match, 0, 0)
+				NetworkSendMatchState(match, NO_WS_CLIENT, 0)
 			} else {
-				NetworkSendReadyUpdate(match, 0, 0)
+				NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
 			}
 		}
 	}
 	NetworkBroadcastLobbyUpdate(network)
 }
 
-NetworkLobbyJoin :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, seq: i64) {
+NetworkLobbyJoin :: proc(app: ^App, client: WsClient, connection: ^WsConnection, seq: i64) {
 	network := &app.network
 	if NetworkPlayerMatchIndex(network, connection.playerId) >= 0 {
 		WsSendError(client, seq, "already_in_match", "Leave the current match before joining matchmaking")
@@ -237,14 +272,14 @@ NetworkLobbyJoin :: proc(app: ^App, client: ws.Client_Connection, connection: ^W
 		WsSendError(client, seq, "lobby_full", "Matchmaking queue is full")
 		return
 	}
-	append(&network.lobby, LobbyEntry{connection.playerId, connection.displayName, client})
+	append(&network.lobby, LobbyEntry{connection.playerId, strings.clone(connection.displayName, network.allocator), client})
 	NetworkBroadcastLobbyUpdate(network)
 	if len(network.lobby) >= 2 {
 		NetworkStartQueuedMatch(app, client, seq)
 	}
 }
 
-NetworkStartQueuedMatch :: proc(app: ^App, sourceClient: ws.Client_Connection, seq: i64) {
+NetworkStartQueuedMatch :: proc(app: ^App, sourceClient: WsClient, seq: i64) {
 	network := &app.network
 	if len(network.lobby) < 2 do return
 	first, second := network.lobby[0], network.lobby[1]
@@ -257,21 +292,23 @@ NetworkStartQueuedMatch :: proc(app: ^App, sourceClient: ws.Client_Connection, s
 	network.nextMatchId += 1
 	match.players[0] = MatchPlayer{
 		playerId = first.playerId,
-		displayName = strings.clone(first.displayName, context.allocator),
+		displayName = strings.clone(first.displayName, network.allocator),
 		connection = first.connection,
 		connected = true,
 		ready = true,
 	}
 	match.players[1] = MatchPlayer{
 		playerId = second.playerId,
-		displayName = strings.clone(second.displayName, context.allocator),
+		displayName = strings.clone(second.displayName, network.allocator),
 		connection = second.connection,
 		connected = true,
 		ready = true,
 	}
 	append(&network.matches, match)
 	matchIndex := len(network.matches) - 1
+	if len(network.lobby[1].displayName) > 0 do delete(network.lobby[1].displayName, network.allocator)
 	unordered_remove(&network.lobby, 1)
+	if len(network.lobby[0].displayName) > 0 do delete(network.lobby[0].displayName, network.allocator)
 	unordered_remove(&network.lobby, 0)
 	NetworkSetConnectionMatch(network, first.connection, match.id)
 	NetworkSetConnectionMatch(network, second.connection, match.id)
@@ -285,7 +322,7 @@ NetworkStartQueuedMatch :: proc(app: ^App, sourceClient: ws.Client_Connection, s
 	NetworkSendMatchStart(matchPtr)
 }
 
-NetworkMatchCreate :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, data: WsClientData, seq: i64) {
+NetworkMatchCreate :: proc(app: ^App, client: WsClient, connection: ^WsConnection, data: WsClientData, seq: i64) {
 	network := &app.network
 	if data.maxPlayers < 2 || data.maxPlayers > logic.MAX_PLAYERS {
 		WsSendError(client, seq, "invalid_player_count", "max_players must be between 2 and 4")
@@ -304,7 +341,7 @@ NetworkMatchCreate :: proc(app: ^App, client: ws.Client_Connection, connection: 
 	network.nextMatchId += 1
 	match.players[0] = MatchPlayer{
 		playerId = connection.playerId,
-		displayName = strings.clone(connection.displayName, context.allocator),
+		displayName = strings.clone(connection.displayName, network.allocator),
 		connection = client,
 		connected = true,
 	}
@@ -312,10 +349,10 @@ NetworkMatchCreate :: proc(app: ^App, client: ws.Client_Connection, connection: 
 	connection.matchId = match.id
 	network.connections[client] = connection^
 	WsSend(client, "match.created", seq, MatchIdWire{match.id})
-	NetworkSendReadyUpdate(&network.matches[len(network.matches) - 1], 0, 0)
+	NetworkSendReadyUpdate(&network.matches[len(network.matches) - 1], NO_WS_CLIENT, 0)
 }
 
-NetworkMatchJoin :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, matchId: i64, seq: i64) {
+NetworkMatchJoin :: proc(app: ^App, client: WsClient, connection: ^WsConnection, matchId: i64, seq: i64) {
 	network := &app.network
 	if NetworkPlayerMatchIndex(network, connection.playerId) >= 0 || NetworkLobbyIndex(network, connection.playerId) >= 0 {
 		WsSendError(client, seq, "already_queued", "Leave the current queue or match first")
@@ -333,7 +370,7 @@ NetworkMatchJoin :: proc(app: ^App, client: ws.Client_Connection, connection: ^W
 	}
 	match.players[match.playerCount] = MatchPlayer{
 		playerId = connection.playerId,
-		displayName = strings.clone(connection.displayName, context.allocator),
+		displayName = strings.clone(connection.displayName, network.allocator),
 		connection = client,
 		connected = true,
 	}
@@ -341,10 +378,10 @@ NetworkMatchJoin :: proc(app: ^App, client: ws.Client_Connection, connection: ^W
 	connection.matchId = match.id
 	network.connections[client] = connection^
 	WsSend(client, "match.joined", seq, MatchIdWire{match.id})
-	NetworkSendReadyUpdate(match, 0, 0)
+	NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
 }
 
-NetworkMatchReady :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, ready: bool, seq: i64) {
+NetworkMatchReady :: proc(app: ^App, client: WsClient, connection: ^WsConnection, ready: bool, seq: i64) {
 	matchIndex := NetworkMatchIndex(&app.network, connection.matchId)
 	if matchIndex < 0 {
 		WsSendError(client, seq, "not_in_match", "Join a private match before readying")
@@ -379,10 +416,10 @@ NetworkSendMatchStart :: proc(match: ^Match) {
 		if !player.connected do continue
 		WsSend(player.connection, "match.start", 0, payload)
 	}
-	NetworkSendMatchState(match, 0, 0)
+	NetworkSendMatchState(match, NO_WS_CLIENT, 0)
 }
 
-NetworkSendMatchState :: proc(match: ^Match, sourceClient: ws.Client_Connection, sourceSeq: i64) {
+NetworkSendMatchState :: proc(match: ^Match, sourceClient: WsClient, sourceSeq: i64) {
 	publicState := BuildPublicGameState(match)
 	turnPlayer := i64(0)
 	if match.game.currentPlayer >= 0 && match.game.currentPlayer < match.playerCount {
@@ -408,7 +445,7 @@ NetworkSendHidden :: proc(match: ^Match, seat: int, seq: i64) {
 	WsSend(match.players[seat].connection, "game.hidden", seq, GameHiddenWire{hand, directives})
 }
 
-NetworkSendReadyUpdate :: proc(match: ^Match, sourceClient: ws.Client_Connection, sourceSeq: i64) {
+NetworkSendReadyUpdate :: proc(match: ^Match, sourceClient: WsClient, sourceSeq: i64) {
 	players := make([]ReadyPlayerWire, match.playerCount, context.temp_allocator)
 	for player, i in match.players[:match.playerCount] {
 		players[i] = ReadyPlayerWire{player.playerId, player.ready}
@@ -423,7 +460,7 @@ NetworkSendReadyUpdate :: proc(match: ^Match, sourceClient: ws.Client_Connection
 	}
 }
 
-NetworkSendMatchError :: proc(match: ^Match, sourceClient: ws.Client_Connection, code, message: string, sourceSeq: i64) {
+NetworkSendMatchError :: proc(match: ^Match, sourceClient: WsClient, code, message: string, sourceSeq: i64) {
 	for player in match.players[:match.playerCount] {
 		if player.connected {
 			seq := i64(0)
@@ -433,7 +470,7 @@ NetworkSendMatchError :: proc(match: ^Match, sourceClient: ws.Client_Connection,
 	}
 }
 
-NetworkGameAction :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, data: WsClientData, seq: i64) {
+NetworkGameAction :: proc(app: ^App, client: WsClient, connection: ^WsConnection, data: WsClientData, seq: i64) {
 	matchIndex := NetworkMatchIndex(&app.network, connection.matchId)
 	if matchIndex < 0 {
 		WsSendActionError(client, seq, "not_in_match")
@@ -515,7 +552,7 @@ WsSendMatchReveal :: proc(match: ^Match, combat: logic.CombatResult, attackerCar
 	}
 }
 
-NetworkEndTurn :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, seq: i64) {
+NetworkEndTurn :: proc(app: ^App, client: WsClient, connection: ^WsConnection, seq: i64) {
 	matchIndex := NetworkMatchIndex(&app.network, connection.matchId)
 	if matchIndex < 0 {
 		WsSendError(client, seq, "not_in_match", "No match is active on this connection")
@@ -559,7 +596,7 @@ NetworkEndTurn :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsC
 	NetworkSendMatchState(match, client, seq)
 }
 
-NetworkForfeit :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsConnection, seq: i64) {
+NetworkForfeit :: proc(app: ^App, client: WsClient, connection: ^WsConnection, seq: i64) {
 	matchIndex := NetworkMatchIndex(&app.network, connection.matchId)
 	if matchIndex < 0 {
 		WsSendError(client, seq, "not_in_match", "No match is active on this connection")
@@ -580,7 +617,7 @@ NetworkForfeit :: proc(app: ^App, client: ws.Client_Connection, connection: ^WsC
 	}
 }
 
-NetworkFinalizeMatch :: proc(app: ^App, matchIndex: int, forfeitBy: i64, sourceClient: ws.Client_Connection, sourceSeq: i64) -> bool {
+NetworkFinalizeMatch :: proc(app: ^App, matchIndex: int, forfeitBy: i64, sourceClient: WsClient, sourceSeq: i64) -> bool {
 	match := &app.network.matches[matchIndex]
 	scores: logic.FinalScores
 	if !logic.CalculateFinalScores(&match.game, &scores) do return false
@@ -641,13 +678,13 @@ NetworkFinalizeMatch :: proc(app: ^App, matchIndex: int, forfeitBy: i64, sourceC
 	for player in match.players[:match.playerCount] {
 		if player.connected do WsSend(player.connection, "match.end", 0, payload)
 		NetworkSetConnectionMatch(&app.network, player.connection, 0)
-		if len(player.displayName) > 0 do delete(player.displayName, context.allocator)
+		if len(player.displayName) > 0 do delete(player.displayName, app.network.allocator)
 	}
 	unordered_remove(&app.network.matches, matchIndex)
 	return true
 }
 
-NetworkChat :: proc(network: ^NetworkState, client: ws.Client_Connection, connection: ^WsConnection, text: string, seq: i64) {
+NetworkChat :: proc(network: ^NetworkState, client: WsClient, connection: ^WsConnection, text: string, seq: i64) {
 	if len(text) < 1 || len(text) > MAX_CHAT_BYTES {
 		WsSendError(client, seq, "invalid_chat", "Chat text must be 1 to 500 bytes")
 		return
@@ -684,9 +721,12 @@ NetworkBroadcastLobbyUpdate :: proc(network: ^NetworkState) {
 	for entry in network.lobby do WsSend(entry.connection, "lobby.update", 0, payload)
 }
 
-NetworkRemoveLobbyPlayer :: proc(network: ^NetworkState, playerId: i64, client: ws.Client_Connection) {
+NetworkRemoveLobbyPlayer :: proc(network: ^NetworkState, playerId: i64, client: WsClient) {
 	for i := len(network.lobby) - 1; i >= 0; i -= 1 {
-		if network.lobby[i].playerId == playerId && network.lobby[i].connection == client do unordered_remove(&network.lobby, i)
+		if network.lobby[i].playerId == playerId && network.lobby[i].connection == client {
+			if len(network.lobby[i].displayName) > 0 do delete(network.lobby[i].displayName, network.allocator)
+			unordered_remove(&network.lobby, i)
+		}
 	}
 }
 
@@ -695,8 +735,8 @@ NetworkLobbyIndex :: proc(network: ^NetworkState, playerId: i64) -> int {
 	return -1
 }
 
-NetworkSetConnectionMatch :: proc(network: ^NetworkState, client: ws.Client_Connection, matchId: i64) {
-	if client == 0 do return
+NetworkSetConnectionMatch :: proc(network: ^NetworkState, client: WsClient, matchId: i64) {
+	if client == NO_WS_CLIENT do return
 	connection, exists := network.connections[client]
 	if exists {
 		connection.matchId = matchId

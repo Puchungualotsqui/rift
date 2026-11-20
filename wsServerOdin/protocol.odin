@@ -37,6 +37,7 @@ HandshakeError :: enum {
 	InvalidUpgrade,
 	InvalidVersion,
 	InvalidKey,
+	InvalidBodyFraming,
 }
 
 Frame :: struct {
@@ -168,11 +169,13 @@ BuildHandshakeResponse :: proc(request: []byte) -> (response: HandshakeResponse,
 		}
 	}
 	if firstSpace <= 0 || secondSpace <= firstSpace + 1 || secondSpace == len(requestLine) - 1 do return response, 0, .InvalidRequestLine
-	if !AsciiEqualCaseInsensitive(requestLine[:firstSpace], "GET") || !AsciiEqualCaseInsensitive(requestLine[secondSpace + 1:], "HTTP/1.1") do return response, 0, .InvalidRequestLine
+	if string(requestLine[:firstSpace]) != "GET" || !AsciiEqualCaseInsensitive(requestLine[secondSpace + 1:], "HTTP/1.1") do return response, 0, .InvalidRequestLine
 
 	required: [5][]byte
 	found: [5]bool
 	duplicate: [5]bool
+	contentLengthFound := false
+	invalidBodyFraming := false
 	headerNames := [?]string{"Host", "Upgrade", "Connection", "Sec-WebSocket-Version", "Sec-WebSocket-Key"}
 	position := lineEnd + 2
 	for {
@@ -191,12 +194,19 @@ BuildHandshakeResponse :: proc(request: []byte) -> (response: HandshakeResponse,
 			}
 		}
 		if colon <= 0 do return response, 0, .MalformedHeader
+		headerName := line[:colon]
+		headerValue := TrimHeaderValue(line[colon + 1:])
+		if AsciiEqualCaseInsensitive(headerName, "Content-Length") {
+			if contentLengthFound || string(headerValue) != "0" do invalidBodyFraming = true
+			contentLengthFound = true
+		}
+		if AsciiEqualCaseInsensitive(headerName, "Transfer-Encoding") do invalidBodyFraming = true
 		for i in 0..<len(headerNames) {
-			if AsciiEqualCaseInsensitive(line[:colon], headerNames[i]) {
+			if AsciiEqualCaseInsensitive(headerName, headerNames[i]) {
 				if found[i] {
 					duplicate[i] = true
 				} else {
-					required[i] = TrimHeaderValue(line[colon + 1:])
+					required[i] = headerValue
 					found[i] = true
 				}
 			}
@@ -204,10 +214,11 @@ BuildHandshakeResponse :: proc(request: []byte) -> (response: HandshakeResponse,
 		position = headerEnd + 2
 	}
 
+	if invalidBodyFraming do return response, 0, .InvalidBodyFraming
 	for i := 0; i < len(found); i += 1 {
 		if !found[i] || duplicate[i] do return response, 0, .MissingRequiredHeader
 	}
-	if len(required[0]) == 0 || !AsciiEqualCaseInsensitive(required[1], "websocket") || !HeaderHasToken(required[2], "Upgrade") do return response, 0, .InvalidUpgrade
+	if len(required[0]) == 0 || !HeaderHasToken(required[1], "websocket") || !HeaderHasToken(required[2], "Upgrade") do return response, 0, .InvalidUpgrade
 	if string(required[3]) != "13" do return response, 0, .InvalidVersion
 	accept, keyValid := WebSocketAcceptKey(string(required[4]))
 	if !keyValid do return response, 0, .InvalidKey
@@ -289,7 +300,8 @@ DecodeFrame :: proc(data, payloadBuffer: []byte) -> (frame: Frame, consumed: int
 	if opcode == .Text && final && !IsValidUTF8(payload) do return frame, 0, .InvalidUTF8
 	if opcode == .Close && payloadSize >= 2 {
 		closeCode := u16(payload[0]) << 8 | u16(payload[1])
-		if !ValidCloseCode(closeCode) || (payloadSize > 2 && !IsValidUTF8(payload[2:])) do return frame, 0, .InvalidCloseFrame
+		if !ValidCloseCode(closeCode) do return frame, 0, .InvalidCloseFrame
+		if payloadSize > 2 && !IsValidUTF8(payload[2:]) do return frame, 0, .InvalidUTF8
 	}
 
 	frame = Frame{final = final, opcode = opcode, payload = payload}
@@ -310,7 +322,8 @@ EncodeFrame :: proc(frame: Frame, destination: []byte) -> (written: int, err: Fr
 		if payloadSize == 1 do return 0, .InvalidCloseFrame
 		if payloadSize >= 2 {
 			closeCode := u16(frame.payload[0]) << 8 | u16(frame.payload[1])
-			if !ValidCloseCode(closeCode) || (payloadSize > 2 && !IsValidUTF8(frame.payload[2:])) do return 0, .InvalidCloseFrame
+			if !ValidCloseCode(closeCode) do return 0, .InvalidCloseFrame
+			if payloadSize > 2 && !IsValidUTF8(frame.payload[2:]) do return 0, .InvalidUTF8
 		}
 	}
 	if frame.opcode == .Text && frame.final && !IsValidUTF8(frame.payload) do return 0, .InvalidUTF8

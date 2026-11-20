@@ -220,7 +220,7 @@ DatabaseStartMatch :: proc(database: ^Database, seed: u64, participants: []Datab
 
 	now := time.to_unix_seconds(time.now())
 	if !DatabasePrepare(database, &stmt, "INSERT INTO matches (started_at, seed) VALUES (?, ?);") do return
-	if !DatabaseBindInt64(stmt, 1, now) || !DatabaseBindInt64(stmt, 2, transmute(i64)seed) || !DatabaseStepDone(database, stmt) do return
+	if !DatabaseBindInt64(stmt, 1, now) || !DatabaseBindInt64(stmt, 2, cast(i64)seed) || !DatabaseStepDone(database, stmt) do return
 	sqlite.finalize(stmt)
 	stmt = nil
 
