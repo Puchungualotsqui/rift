@@ -2,3 +2,6 @@ rift.sqlite
 rift.sqlite-shm
 rift.sqlite-wal
 server.exe
+client/rift.exe
+client/bin/
+client/build/
