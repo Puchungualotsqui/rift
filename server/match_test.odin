@@ -4,6 +4,7 @@ package server
 
 import logic "../logicEngine"
 import "core:testing"
+import "core:time"
 
 @(test)
 TestAuthoritativeMatchSetupAndActions :: proc(t: ^testing.T) {
@@ -65,4 +66,84 @@ TestAuthoritativeMatchSetupAndActions :: proc(t: ^testing.T) {
 	testing.expect(t, !applied)
 	testing.expect_value(t, reason, "unknown_action")
 	testing.expect_value(t, match.game, before)
+}
+
+@(test)
+TestPrivateWaitingMatchExpiresAfterDisconnect :: proc(t: ^testing.T) {
+	database: Database
+	if !DatabaseInit(&database, ":memory:") {
+		testing.expect(t, false)
+		return
+	}
+	defer DatabaseDeinit(&database)
+
+	app := App{database = &database}
+	NetworkInit(&app.network)
+	defer NetworkDeinit(&app.network)
+	app.network.waitingDisconnectTimeout = 0
+
+	match := Match{id = 1, maxPlayers = 2, playerCount = 1, status = .Waiting}
+	match.players[0] = MatchPlayer{
+		playerId = 1,
+		disconnectedAt = time.tick_now(),
+		hasDisconnectedAt = true,
+	}
+	append(&app.network.matches, match)
+
+	NetworkProcessMatchDeadlines(&app, time.tick_now())
+	testing.expect_value(t, len(app.network.matches), 0)
+}
+
+@(test)
+TestDisconnectedCurrentPlayerForfeitsAfterGrace :: proc(t: ^testing.T) {
+	database: Database
+	if !DatabaseInit(&database, ":memory:") {
+		testing.expect(t, false)
+		return
+	}
+	defer DatabaseDeinit(&database)
+
+	first, firstCreated := DatabaseCreateGuestSession(&database)
+	second, secondCreated := DatabaseCreateGuestSession(&database)
+	if !firstCreated || !secondCreated {
+		testing.expect(t, false)
+		return
+	}
+
+	app := App{database = &database}
+	NetworkInit(&app.network)
+	defer NetworkDeinit(&app.network)
+	app.network.turnReconnectGrace = 0
+	app.network.maxReconnectGrace = 0
+
+	match := Match{id = 1, maxPlayers = 2, playerCount = 2, status = .Waiting}
+	match.players[0] = MatchPlayer{playerId = first.playerId, connected = true}
+	match.players[1] = MatchPlayer{playerId = second.playerId, connected = true}
+	if !StartAuthoritativeMatch(&app, &match) {
+		testing.expect(t, false)
+		return
+	}
+
+	for &player in match.players[:match.playerCount] {
+		player.connected = false
+		player.connection = NO_WS_CLIENT
+	}
+	forfeitPlayerId := match.players[match.game.currentPlayer].playerId
+	append(&app.network.matches, match)
+
+	NetworkProcessMatchDeadlines(&app, time.tick_now())
+	testing.expect_value(t, len(app.network.matches), 0)
+
+	firstProfile, firstAuthenticated := DatabaseAuthenticate(&database, first.sessionToken)
+	secondProfile, secondAuthenticated := DatabaseAuthenticate(&database, second.sessionToken)
+	testing.expect(t, firstAuthenticated && secondAuthenticated)
+	testing.expect_value(t, firstProfile.gamesPlayed, i64(1))
+	testing.expect_value(t, secondProfile.gamesPlayed, i64(1))
+	if forfeitPlayerId == first.playerId {
+		testing.expect_value(t, firstProfile.wins, i64(0))
+		testing.expect_value(t, secondProfile.wins, i64(1))
+	} else {
+		testing.expect_value(t, firstProfile.wins, i64(1))
+		testing.expect_value(t, secondProfile.wins, i64(0))
+	}
 }

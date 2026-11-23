@@ -185,3 +185,54 @@ TestMatchPersistenceRollback :: proc(t: ^testing.T) {
 		testing.expect(t, false)
 	}
 }
+
+@(test)
+TestAbortUnfinishedMatches :: proc(t: ^testing.T) {
+	database: Database
+	if !DatabaseInit(&database, ":memory:") {
+		testing.expect(t, false)
+		return
+	}
+	defer DatabaseDeinit(&database)
+
+	player, created := DatabaseCreateGuestSession(&database)
+	if !created {
+		testing.expect(t, false)
+		return
+	}
+	participants := [?]DatabaseMatchParticipant{{playerId = player.playerId, faction = "Nomad"}}
+	matchId, started := DatabaseStartMatch(&database, 77, participants[:])
+	if !started {
+		testing.expect(t, false)
+		return
+	}
+
+	testing.expect(t, DatabaseAbortUnfinishedMatches(&database))
+	testing.expect(t, DatabaseAbortUnfinishedMatches(&database))
+
+	stmt: ^sqlite.Statement
+	defer if stmt != nil do sqlite.finalize(stmt)
+	if !DatabasePrepare(&database, &stmt, "SELECT ended_at, winner_player FROM matches WHERE match_id = ?;") {
+		testing.expect(t, false)
+		return
+	}
+	if !DatabaseBindInt64(stmt, 1, matchId) || sqlite.step(stmt) != .Row {
+		testing.expect(t, false)
+		return
+	}
+	testing.expect(t, sqlite.column_int64(stmt, 0) > 0)
+	testing.expect_value(t, sqlite.column_int64(stmt, 1), i64(0))
+
+	sqlite.finalize(stmt)
+	stmt = nil
+	if !DatabasePrepare(&database, &stmt, "SELECT games_played, wins FROM player_stats WHERE player_id = ?;") {
+		testing.expect(t, false)
+		return
+	}
+	if !DatabaseBindInt64(stmt, 1, player.playerId) || sqlite.step(stmt) != .Row {
+		testing.expect(t, false)
+		return
+	}
+	testing.expect_value(t, sqlite.column_int64(stmt, 0), i64(0))
+	testing.expect_value(t, sqlite.column_int64(stmt, 1), i64(0))
+}

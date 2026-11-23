@@ -38,6 +38,7 @@ WsAuthTimeoutThread :: proc(app: ^App) {
 			sync.unlock(&app.network.mutex)
 			return
 		}
+		NetworkProcessMatchDeadlines(app, now)
 		for client, connection in app.network.connections {
 			elapsed := time.tick_diff(connection.openedAt, now)
 			if !connection.authenticated && !connection.authTimedOut && elapsed >= app.network.authTimeout do append(&clients, client)
@@ -51,6 +52,88 @@ WsAuthTimeoutThread :: proc(app: ^App) {
 		}
 		sync.unlock(&app.network.mutex)
 		for client in clients do WsCloseClient(client)
+	}
+}
+
+NetworkStartReconnectGrace :: proc(network: ^NetworkState, match: ^Match, now: time.Tick) {
+	if match.status != .Started || match.game.phase != .Acting do return
+	seat := match.game.currentPlayer
+	if seat < 0 || seat >= match.playerCount do return
+	player := &match.players[seat]
+	if player.connected || player.reconnectGraceActive do return
+
+	remaining := network.maxReconnectGrace - player.reconnectGraceSpent
+	if remaining < 0 do remaining = 0
+	duration := network.turnReconnectGrace
+	if duration > remaining do duration = remaining
+	player.reconnectGraceStartedAt = now
+	player.reconnectGraceDuration = duration
+	player.reconnectGraceActive = true
+}
+
+NetworkAccountReconnectGrace :: proc(network: ^NetworkState, player: ^MatchPlayer, now: time.Tick) {
+	if !player.reconnectGraceActive do return
+	elapsed := time.tick_diff(player.reconnectGraceStartedAt, now)
+	if elapsed > player.reconnectGraceDuration do elapsed = player.reconnectGraceDuration
+	player.reconnectGraceSpent += elapsed
+	if player.reconnectGraceSpent > network.maxReconnectGrace do player.reconnectGraceSpent = network.maxReconnectGrace
+	player.reconnectGraceActive = false
+}
+
+NetworkProcessMatchDeadlines :: proc(app: ^App, now: time.Tick) {
+	network := &app.network
+	matchIndex := 0
+	for matchIndex < len(network.matches) {
+		match := &network.matches[matchIndex]
+		switch match.status {
+		case .Waiting:
+			removedPlayer := false
+			seat := 0
+			for seat < match.playerCount {
+				player := &match.players[seat]
+				if player.hasDisconnectedAt && time.tick_diff(player.disconnectedAt, now) >= network.waitingDisconnectTimeout {
+					if len(player.displayName) > 0 do delete(player.displayName, network.allocator)
+					for move := seat; move < match.playerCount - 1; move += 1 {
+						match.players[move] = match.players[move + 1]
+					}
+					match.playerCount -= 1
+					match.players[match.playerCount] = {}
+					removedPlayer = true
+				} else {
+					seat += 1
+				}
+			}
+			if removedPlayer {
+				if match.playerCount == 0 {
+					unordered_remove(&network.matches, matchIndex)
+					continue
+				}
+				NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
+			}
+		case .Started:
+			NetworkStartReconnectGrace(network, match, now)
+			seat := match.game.currentPlayer
+			if seat >= 0 && seat < match.playerCount {
+				player := &match.players[seat]
+				if !player.connected && player.reconnectGraceActive &&
+					time.tick_diff(player.reconnectGraceStartedAt, now) >= player.reconnectGraceDuration {
+					forfeitBy := player.playerId
+					before := match.game
+					match.game.phase = .Finished
+					if !NetworkFinalizeMatch(app, matchIndex, forfeitBy, NO_WS_CLIENT, 0) {
+						match.game = before
+						if !player.reconnectGraceFailureLogged {
+							log.errorf("Could not finalize match %d after player %d reconnect grace expired", match.id, forfeitBy)
+							player.reconnectGraceFailureLogged = true
+						}
+					} else {
+						continue
+					}
+				}
+			}
+		case .Finished:
+		}
+		matchIndex += 1
 	}
 }
 
@@ -107,8 +190,18 @@ WsOnClose :: proc(server: ^ws.Server, clientID: ws.ClientID) {
 			match := &app.network.matches[matchIndex]
 			seat := NetworkMatchPlayerIndex(match, connection.playerId)
 			if seat >= 0 && match.players[seat].connection == client {
-				match.players[seat].connected = false
-				match.players[seat].connection = NO_WS_CLIENT
+				player := &match.players[seat]
+				player.connected = false
+				player.connection = NO_WS_CLIENT
+				player.disconnectedAt = time.tick_now()
+				player.hasDisconnectedAt = true
+				if match.status == .Waiting {
+					player.ready = false
+					NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
+				} else if match.status == .Started {
+					NetworkStartReconnectGrace(&app.network, match, time.tick_now())
+					NetworkSendMatchState(match, NO_WS_CLIENT, 0)
+				}
 			}
 		}
 		if len(connection.sessionToken) > 0 do delete(connection.sessionToken, app.network.allocator)
@@ -187,7 +280,7 @@ WsOnMessage :: proc(server: ^ws.Server, clientID: ws.ClientID, opcode: ws.Opcode
 		connection.displayName = strings.clone(profile.displayName, app.network.allocator)
 		app.network.connections[client] = connection
 		WsSend(client, "auth.ok", request.seq, AuthOkWire{profile.playerId, profile.displayName})
-		NetworkAttachPlayer(&app.network, client, &connection)
+		NetworkAttachPlayer(app, client, &connection)
 		return
 	}
 
@@ -230,7 +323,9 @@ WsOnMessage :: proc(server: ^ws.Server, clientID: ws.ClientID, opcode: ws.Opcode
 	}
 }
 
-NetworkAttachPlayer :: proc(network: ^NetworkState, client: WsClient, connection: ^WsConnection) {
+NetworkAttachPlayer :: proc(app: ^App, client: WsClient, connection: ^WsConnection) {
+	network := &app.network
+	NetworkProcessMatchDeadlines(app, time.tick_now())
 	for i in 0..<len(network.lobby) {
 		if network.lobby[i].playerId == connection.playerId {
 			network.lobby[i].connection = client
@@ -241,15 +336,23 @@ NetworkAttachPlayer :: proc(network: ^NetworkState, client: WsClient, connection
 		match := &network.matches[matchIndex]
 		seat := NetworkMatchPlayerIndex(match, connection.playerId)
 		if seat >= 0 {
-			match.players[seat].connection = client
-			match.players[seat].connected = true
-			connection.matchId = match.id
-			network.connections[client] = connection^
-			if match.status == .Started {
-				WsSend(client, "match.start", 0, BuildMatchStartWire(match))
-				NetworkSendMatchState(match, NO_WS_CLIENT, 0)
-			} else {
-				NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
+			player := &match.players[seat]
+			graceExpired := player.reconnectGraceActive &&
+				time.tick_diff(player.reconnectGraceStartedAt, time.tick_now()) >= player.reconnectGraceDuration
+			if !graceExpired {
+				if player.reconnectGraceActive do NetworkAccountReconnectGrace(network, player, time.tick_now())
+				player.connection = client
+				player.connected = true
+				player.hasDisconnectedAt = false
+				player.reconnectGraceActive = false
+				connection.matchId = match.id
+				network.connections[client] = connection^
+				if match.status == .Started {
+					WsSend(client, "match.start", 0, BuildMatchStartWire(match))
+					NetworkSendMatchState(match, NO_WS_CLIENT, 0)
+				} else {
+					NetworkSendReadyUpdate(match, NO_WS_CLIENT, 0)
+				}
 			}
 		}
 	}
@@ -401,7 +504,7 @@ NetworkMatchReady :: proc(app: ^App, client: WsClient, connection: ^WsConnection
 	NetworkSendReadyUpdate(match, client, seq)
 	if match.playerCount != match.maxPlayers do return
 	for player in match.players[:match.playerCount] {
-		if !player.ready do return
+		if !player.connected || !player.ready do return
 	}
 	if !StartAuthoritativeMatch(app, match) {
 		NetworkSendMatchError(match, client, "match_setup_failed", "Could not initialize the authoritative match", seq)
@@ -592,6 +695,7 @@ NetworkEndTurn :: proc(app: ^App, client: WsClient, connection: ^WsConnection, s
 		}
 		return
 	}
+	NetworkStartReconnectGrace(&app.network, match, time.tick_now())
 	WsSend(client, "game.action_ok", seq, ActionAckWire{seq})
 	NetworkSendMatchState(match, client, seq)
 }
@@ -672,7 +776,7 @@ NetworkFinalizeMatch :: proc(app: ^App, matchIndex: int, forfeitBy: i64, sourceC
 	}
 	if winnerCount == 0 || !DatabaseFinishMatch(app.database, match.databaseId, winnerPlayerId, results) do return false
 
-	WsSend(sourceClient, "game.action_ok", sourceSeq, ActionAckWire{sourceSeq})
+	if sourceClient != NO_WS_CLIENT do WsSend(sourceClient, "game.action_ok", sourceSeq, ActionAckWire{sourceSeq})
 	payload := MatchEndWire{match.id, winnerPlayerId, winners[:], forfeitBy, breakdown}
 	match.status = .Finished
 	for player in match.players[:match.playerCount] {

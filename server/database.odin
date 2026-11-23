@@ -66,6 +66,10 @@ DatabaseInit :: proc(database: ^Database, path: cstring) -> bool {
 			return false
 		}
 	}
+	if !DatabaseAbortUnfinishedMatches(database) {
+		DatabaseDeinit(database)
+		return false
+	}
 
 	return true
 }
@@ -205,6 +209,16 @@ DatabaseRevokeSession :: proc(database: ^Database, token: string) -> bool {
 	if !DatabasePrepare(database, &stmt, "DELETE FROM sessions WHERE session_token = ?;") do return false
 	defer sqlite.finalize(stmt)
 	return DatabaseBindText(stmt, 1, token) && DatabaseStepDone(database, stmt)
+}
+
+DatabaseAbortUnfinishedMatches :: proc(database: ^Database) -> bool {
+	sync.lock(&database.mutex)
+	defer sync.unlock(&database.mutex)
+
+	stmt: ^sqlite.Statement
+	if !DatabasePrepare(database, &stmt, "UPDATE matches SET ended_at = ?, winner_player = NULL WHERE ended_at IS NULL;") do return false
+	defer sqlite.finalize(stmt)
+	return DatabaseBindInt64(stmt, 1, time.to_unix_seconds(time.now())) && DatabaseStepDone(database, stmt)
 }
 
 DatabaseStartMatch :: proc(database: ^Database, seed: u64, participants: []DatabaseMatchParticipant) -> (matchId: i64, ok: bool) {

@@ -9,6 +9,9 @@ import "core:sync"
 import "core:time"
 
 MAX_LOBBY_PLAYERS :: 256
+PRIVATE_MATCH_DISCONNECT_TIMEOUT :: 5 * time.Minute
+TURN_RECONNECT_GRACE :: 2 * time.Minute
+MAX_PLAYER_RECONNECT_GRACE :: 5 * time.Minute
 
 MatchStatus :: enum {
 	Waiting,
@@ -28,8 +31,11 @@ NetworkState :: struct {
 	websocket:    ws.Server,
 	allocator:    runtime.Allocator,
 	shuttingDown: bool,
-	authTimeout:  time.Duration,
-	connections:  map[WsClient]WsConnection,
+	authTimeout:              time.Duration,
+	waitingDisconnectTimeout: time.Duration,
+	turnReconnectGrace:       time.Duration,
+	maxReconnectGrace:        time.Duration,
+	connections:               map[WsClient]WsConnection,
 	matches:      [dynamic]Match,
 	lobby:        [dynamic]LobbyEntry,
 	nextMatchId:  i64,
@@ -53,13 +59,20 @@ LobbyEntry :: struct {
 }
 
 MatchPlayer :: struct {
-	playerId:    i64,
-	displayName: string,
-	faction:     logic.Faction,
-	start:       logic.Hex,
-	connection:  WsClient,
-	connected:   bool,
-	ready:       bool,
+	playerId:                   i64,
+	displayName:                string,
+	faction:                    logic.Faction,
+	start:                      logic.Hex,
+	connection:                 WsClient,
+	connected:                  bool,
+	ready:                      bool,
+	disconnectedAt:             time.Tick,
+	hasDisconnectedAt:          bool,
+	reconnectGraceStartedAt:    time.Tick,
+	reconnectGraceDuration:     time.Duration,
+	reconnectGraceSpent:        time.Duration,
+	reconnectGraceActive:       bool,
+	reconnectGraceFailureLogged: bool,
 }
 
 Match :: struct {
@@ -277,6 +290,9 @@ NetworkInit :: proc(state: ^NetworkState) {
 	state.matches = make([dynamic]Match, 0, 16, state.allocator)
 	state.lobby = make([dynamic]LobbyEntry, 0, MAX_LOBBY_PLAYERS, state.allocator)
 	state.authTimeout = WS_AUTH_TIMEOUT
+	state.waitingDisconnectTimeout = PRIVATE_MATCH_DISCONNECT_TIMEOUT
+	state.turnReconnectGrace = TURN_RECONNECT_GRACE
+	state.maxReconnectGrace = MAX_PLAYER_RECONNECT_GRACE
 	state.nextMatchId = 1
 }
 
